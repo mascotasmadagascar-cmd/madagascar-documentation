@@ -75,45 +75,55 @@ These resources are physically shared between multiple services. Misconfiguring 
 
 **Purpose**: When admin edits website content, the public site needs to refresh its cached pages.
 
+**Implementation**: `ASTRO_SERVICE` service binding (zero-latency internal call, no TLS/DNS overhead).
+
 ```
 cf-admin (content edit)
     │
-    ├─ Writes new content to D1 cms_content table
-    ├─ Writes new content to KV ISR_CACHE (direct injection — bypasses wait)
+    ├─ UPDATE D1 cms_content table
+    ├─ PUT fresh CMS JSON into cf-astro KV (direct KV injection — bypasses D1 lag)
     │
-    └─ POST https://madagascarhotelags.com/api/revalidate
-           Header: Authorization: Bearer {REVALIDATION_SECRET}
-           Body: { paths: ['/es/', '/en/'] }
-               │
-               cf-astro verifies secret
-               cf-astro deletes matching KV keys → next visitor gets fresh SSR
+    └─ env.ASTRO_SERVICE.fetch('/api/revalidate', {
+           method: 'POST',
+           headers: { Authorization: 'Bearer {REVALIDATION_SECRET}' },
+           body: JSON.stringify({ paths: ['/es/', '/en/'], cmsData: { ... } })
+       })
+           │
+           cf-astro verifies REVALIDATION_SECRET
+           cf-astro deletes matching KV ISR_CACHE keys (deploy-scoped)
+           Next visitor gets fresh SSR → saved back to KV
 ```
 
-**Shared secret**: `REVALIDATION_SECRET` — must be identical in both services' secrets.
+**Retry policy**: 3 attempts with exponential backoff (300ms → 600ms → 900ms). If all fail, D1 content is updated but cached HTML is stale until next visitor triggers fresh SSR or 24h KV TTL expires.
 
-**Failure behavior**: If cf-astro is unreachable, cf-admin retries 3× with exponential backoff. If all fail, the D1 content is updated but the cached HTML is stale until the next user visits (which triggers a fresh render) or the KV TTL expires.
+**Shared secret**: `REVALIDATION_SECRET` — must be identical in both services.
+
+---
 
 ### cf-admin → cf-chatbot (Admin API Proxy)
 
 **Purpose**: cf-admin hosts the chatbot management UI (KB editor, model config, analytics). All chatbot admin operations proxy through cf-admin to cf-chatbot.
+
+**Implementation**: `CHATBOT_SERVICE` service binding (zero-latency internal call). HTTP fallback via `CHATBOT_WORKER_URL` retained for emergency use only.
 
 ```
 Admin user in browser
     │
     └─ cf-admin /api/chatbot/[...path]
            │
-           ├─ Authenticates admin (Zero Trust session required)
-           ├─ Forwards request to: {CHATBOT_WORKER_URL}/api/admin/{path}
-           │  Header: X-Admin-Key: {CHATBOT_ADMIN_API_KEY}
+           ├─ Validates Zero Trust session (role: admin+)
            │
-           cf-chatbot verifies X-Admin-Key header
-           cf-chatbot performs KB CRUD / config change
-           Returns response → cf-admin → browser
+           └─ env.CHATBOT_SERVICE.fetch(
+                new Request(`http://internal/api/admin/${path}`, {
+                  method, headers, body  // forwarded from admin request
+                })
+              )
+                   │
+                   cf-chatbot performs KB CRUD / config change
+                   Returns response → cf-admin → browser
 ```
 
-**Shared secret**: `CHATBOT_ADMIN_API_KEY` — must match in both services.
-
-**Current implementation**: HTTP via public URL (`CHATBOT_WORKER_URL = https://charlar.madagascarhotelags.com`). Planned upgrade to Cloudflare Service Bindings to eliminate network hop (see [Implementations & Blockers](./implementations-and-blockers.md)).
+**No auth header needed**: Service binding is implicit trust — `CHATBOT_ADMIN_API_KEY` is only used when the HTTP fallback (`CHATBOT_WORKER_URL`) is invoked.
 
 ### cf-astro / cf-admin → cf-email-consumer (Queue)
 
@@ -223,8 +233,8 @@ cf-astro (booking submitted)              cf-admin (contact reply)
 2. Browser submits PATCH to cf-admin /api/content/blocks
 3. cf-admin: verify admin session + RBAC (editor or above)
 4. cf-admin: UPDATE D1 cms_content table
-5. cf-admin: PUT new content into KV ISR_CACHE (direct injection)
-6. cf-admin: POST cf-astro /api/revalidate (Bearer token)
+5. cf-admin: PUT new content into KV ISR_CACHE (direct injection — bypasses D1 lag)
+6. cf-admin: env.ASTRO_SERVICE.fetch('/api/revalidate') [Service Binding — zero-latency]
 7. cf-astro: verify REVALIDATION_SECRET
 8. cf-astro: DELETE KV keys matching isr:{buildId}:/es/* and isr:{buildId}:/en/*
 9. Admin sees success toast ← ~400ms total

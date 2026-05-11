@@ -1,123 +1,242 @@
 # cf-admin — Diagnostics & Monitoring
 
-> System health checks, infrastructure dashboards, and Sentry integration.
+Diagnostic test suite (connectivity, functional, security), run lifecycle, API endpoints, Sentry integration, and monitoring gaps.
 
 ---
 
-## The Diagnostics Portal (`/dashboard/debug/diagnostics`)
+## Diagnostics Portal (`/dashboard/debug/diagnostics`)
 
-cf-admin includes a built-in infrastructure diagnostics portal designed for developers and system administrators (requires `dev` role). It provides real-time visibility into the health of the entire Madagascar ecosystem.
-
-### Key Features
-1. **Real-time Status Matrix**: Red/Green status indicators for all external dependencies (Supabase, Upstash, Resend).
-2. **Internal Service Health**: Connectivity checks between cf-admin, cf-astro, and cf-chatbot.
-3. **Cloudflare Resource Monitor**: Live read/write operational status for D1, KV, and Vectorize bindings.
-4. **Audit Log Viewer**: UI for browsing D1-backed security audit logs and Cloudflare Access logs.
+The diagnostics portal provides real-time and historical visibility into the health of the entire Madagascar infrastructure. Access requires the `dev` role.
 
 ---
 
-## Health Check Implementation
+## Diagnostic Test Suite (`src/lib/diagnostics/`)
 
-The `/api/diagnostics/health` endpoint aggregates status from multiple sources using `Promise.allSettled` to prevent a single slow service from blocking the report.
+The suite is composed of three test categories. All tests within a category run concurrently via `Promise.allSettled()` — a single slow or failing test does not block the others.
 
-### Check Types
+### Connectivity Tests
 
-| Component | Check Method | Timeout |
-|-----------|--------------|---------|
-| **Supabase** | `SELECT 1` via Supabase JS | 3s |
-| **D1** | `SELECT 1` via binding | 1s |
-| **KV** | `get('health_check')` via binding | 1s |
-| **Upstash** | `GET` health endpoint via `fetch` | 3s |
-| **Resend** | `GET /emails` (list limit=1) via `fetch` | 3s |
-| **cf-astro** | `GET {SITE_URL}/api/health` | 2s |
-| **cf-chatbot** | `GET {CHATBOT_URL}/api/health` | 2s |
+Verify that all external services and bindings are reachable from the Worker:
 
-### Example Response Payload
+| Test | Method | What Is Measured |
+|------|--------|-----------------|
+| D1 database ping | `SELECT 1` via D1 binding | Reachability and query latency |
+| R2 bucket connectivity | List objects via R2 binding | R2 binding operational |
+| KV namespace read/write | PUT + GET + DELETE cycle | Full KV round-trip functional |
+| Supabase REST API ping | REST health endpoint via `fetch` | Supabase reachable from Worker |
+| Upstash Redis connection | Redis PING command | Rate limit store reachable |
+
+### Functional Tests
+
+Verify that core application logic works end-to-end:
+
+| Test | What Is Verified |
+|------|-----------------|
+| Session creation + retrieval roundtrip | Write AdminSession to KV → read back → compare fields |
+| PLAC access map computation | D1 JOIN query executes; access map is valid |
+| JWT verification (dummy token) | `verifyZeroTrustJwt()` correctly rejects a malformed token |
+| Rate limiter functionality | Upstash sliding window correctly increments counter |
+
+### Security Tests
+
+Verify that security controls are active and functional:
+
+| Test | What Is Verified |
+|------|-----------------|
+| CSRF token validation | `csrf.ts` rejects request with invalid/missing Origin header |
+| Rate limit enforcement | Endpoint returns 429 after configured threshold is exceeded |
+| Page access restriction | PLAC correctly denies access to a path the test user has no rights to |
+| Role hierarchy enforcement | `hasPermission()` denies a lower-privileged role the required higher-privileged action |
+
+---
+
+## Diagnostic Run Lifecycle
+
+```
+1. Admin clicks "Run Diagnostics" in SystemDiagnostics.tsx
+2. Browser sends: POST /api/diagnostics/run
+3. Worker generates a run_id (UUID)
+4. Worker returns immediately: { run_id, status: "started" }
+      ↓ (parallel, via ctx.waitUntil)
+5. runner.ts executes all three test categories concurrently
+6. Each test result shape:
+   {
+     category: "connectivity" | "functional" | "security",
+     name: "D1 database ping",
+     status: "pass" | "fail" | "degraded",
+     latencyMs: 2,
+     error?: "Error message if failed"
+   }
+7. Overall status computed:
+   - "pass"     → all tests passed
+   - "degraded" → all completed but some showed warnings or elevated latency
+   - "fail"     → one or more tests failed or threw
+8. Results written to D1 admin_diagnostic_runs:
+   { id, run_id, test_results (JSON), overall_status, created_at }
+9. UI polls GET /api/diagnostics/results or uses run_id to fetch
+```
+
+---
+
+## D1 Results Schema
+
+```sql
+CREATE TABLE admin_diagnostic_runs (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  test_results TEXT,        -- JSON array of individual test result objects
+  overall_status TEXT,      -- pass | fail | degraded
+  created_at TEXT
+);
+```
+
+---
+
+## Diagnostic API Endpoints
+
+| Method | Path | Min Role | Description |
+|--------|------|----------|-------------|
+| GET | `/api/diagnostics/ping` | — | Simple liveness check — returns `{ "ok": true }` |
+| GET | `/api/health` | — | Public health check with D1, KV, R2, Supabase latency |
+| POST | `/api/diagnostics/run` | dev | Start full diagnostic suite; returns run_id immediately |
+| GET | `/api/diagnostics/results` | dev | Fetch all historical diagnostic runs from D1 |
+| GET | `/api/diagnostics/infrastructure` | admin | Real-time infrastructure status (not persisted) |
+
+### `GET /api/health` Response Shape
+
 ```json
 {
-  "status": "degraded",
-  "timestamp": "2026-05-08T05:00:00Z",
+  "status": "healthy" | "degraded" | "down",
+  "timestamp": "2026-05-10T12:00:00Z",
   "components": {
-    "supabase": { "status": "up", "latencyMs": 45 },
-    "d1": { "status": "up", "latencyMs": 2 },
-    "kv": { "status": "up", "latencyMs": 5 },
-    "cf_astro": { "status": "up", "latencyMs": 30 },
-    "cf_chatbot": { "status": "down", "error": "Connection timeout" },
-    "upstash": { "status": "up", "latencyMs": 15 },
-    "resend": { "status": "up", "latencyMs": 120 }
+    "d1":       { "status": "up", "latencyMs": 2 },
+    "kv":       { "status": "up", "latencyMs": 4 },
+    "r2":       { "status": "up", "latencyMs": 8 },
+    "supabase": { "status": "up", "latencyMs": 35 }
   }
+}
+```
+
+### `GET /api/diagnostics/results` Response Shape
+
+```json
+{
+  "data": [
+    {
+      "id": "hex16",
+      "run_id": "uuid",
+      "overall_status": "pass",
+      "created_at": "2026-05-10T12:00:00Z",
+      "test_results": [
+        {
+          "category": "connectivity",
+          "name": "D1 database ping",
+          "status": "pass",
+          "latencyMs": 2
+        },
+        {
+          "category": "security",
+          "name": "CSRF token validation",
+          "status": "pass",
+          "latencyMs": 0
+        }
+      ]
+    }
+  ]
 }
 ```
 
 ---
 
-## Log Ingestion (Cloudflare Access)
+## Diagnostics UI Components
 
-A crucial security feature is the ingestion of Cloudflare Access authentication logs into the administrative dashboard.
+| Component | Purpose |
+|-----------|---------|
+| `SystemDiagnostics.tsx` | Main panel — trigger runs, show current status |
+| `DiagnosticsTestList.tsx` | Table of all test results with pass/fail indicators per category |
+| `DiagnosticsInfraBar.tsx` | Compact health strip shown at the top of debug pages |
+| `SystemDiagnosticsHistory.tsx` | Historical run browser — view all past runs from D1 |
+| `PageRegistryManager.tsx` | View and toggle `is_active` on pages in `admin_pages` |
 
-### The Cron Flow
+---
 
-1. **Trigger**: `crons = ["*/30 * * * *"]` (Wrangler configuration).
-2. **Fetch**: The worker calls the Cloudflare API (`https://api.cloudflare.com/client/v4/accounts/{account_id}/access/logs/access_requests`).
-3. **Filter**: Extracts logs specific to the cf-admin application (`CF_ACCESS_AUD`).
-4. **Store**: Inserts new records into the D1 `cf_access_audit_log` table.
+## Performance Benchmarks (`src/lib/diagnostics/benchmarks.ts`)
 
-This allows administrators to see failed login attempts and unauthorized access attempts directly within the cf-admin UI, without needing to log into the Cloudflare dashboard.
+The benchmarks module collects latency measurements during diagnostic runs and includes them in the run report:
+
+- D1 query latency (single-statement and JOIN)
+- KV read and write round-trip latency
+- Supabase query latency
+- Upstash Redis command latency
+- CHATBOT_SERVICE internal call latency
+- ASTRO_SERVICE internal call latency
+
+Benchmark results are appended to the `test_results` JSON array in `admin_diagnostic_runs`.
 
 ---
 
 ## Sentry Integration
 
-cf-admin uses Sentry for error tracking and distributed tracing.
-
 ### Configuration
+
 ```typescript
 // sentry.server.config.ts
-import * as Sentry from '@sentry/cloudflare';
+import * as Sentry from '@sentry/astro';
 
 Sentry.init({
-  dsn: env.PUBLIC_SENTRY_DSN,
-  tracesSampleRate: 1.0, // 100% sampling for admin operations
+  dsn: env.PUBLIC_SENTRY_DSN,  // https://389bb...@o4510752...ingest.us.sentry.io/4511193...
+  tracesSampleRate: 1.0,        // 100% sampling — all admin operations traced
 });
 ```
 
-### Automatic Instrumentation
-The `@sentry/cloudflare` SDK automatically wraps the `fetch` handler in `src/index.ts`, capturing:
-- Unhandled exceptions
-- Outgoing HTTP requests (Supabase, Resend)
-- Request metadata (headers, URL, method)
+### What Sentry Captures
 
-### Custom Context
-The authentication middleware enriches the Sentry context with user data:
+- Unhandled exceptions in middleware and API routes
+- Outgoing subrequest errors (Supabase, Resend, Upstash)
+- Source maps uploaded during CI/CD build (requires `SENTRY_AUTH_TOKEN`)
+- Distributed traces across the request lifecycle
+
+### Session Context Enrichment
+
+The middleware sets Sentry user context after session retrieval:
+
 ```typescript
-// middleware.ts
 if (session) {
   Sentry.setUser({
     id: session.userId,
     email: session.email,
-    role: session.role
+    // role intentionally omitted from Sentry context (PII minimization)
   });
 }
 ```
 
+### CI/CD Source Map Upload
+
+Source maps are uploaded during `npm run cf:deploy` using:
+- `SENTRY_AUTH_TOKEN` (CI secret)
+- `SENTRY_ORG_SLUG`
+- `SENTRY_PROJECT_SLUG`
+
+These are not required at runtime — only at build time.
+
 ---
 
-## Analytics Engine
+## Monitoring Gaps
 
-While cf-astro uses Analytics Engine for public traffic telemetry, cf-admin uses it for internal usage metrics.
+The following monitoring capabilities are **not** currently implemented in cf-admin:
 
-### Tracking Admin Activity
-```typescript
-env.ANALYTICS.writeDataPoint({
-  blobs: [
-    'admin_action',
-    session.role,
-    url.pathname,
-    request.method
-  ],
-  doubles: [1],
-  indexes: [session.userId], // Indexed by user ID for fast querying
-});
-```
+| Gap | Notes |
+|-----|-------|
+| BetterStack / Logtail | cf-astro uses Logtail; cf-admin uses Sentry only |
+| Uptime monitoring | No external uptime check configured for `secure.madagascarhotelags.com` |
+| Alerting on high error rates | Sentry captures errors but no alert thresholds are configured |
+| Analytics Engine dashboards | The `ANALYTICS` binding exists but no custom dashboard is built |
+| Cron failure alerting | If the CF Access audit cron fails silently, there is no alert |
 
-These metrics help identify which dashboard modules are actively used and which roles perform the most actions.
+---
+
+## Infrastructure Status Components
+
+The `GET /api/diagnostics/infrastructure` endpoint (min role: `admin`) returns real-time status without persisting to D1. Used by `DiagnosticsInfraBar.tsx` to show the health strip on debug pages.
+
+Unlike `POST /api/diagnostics/run`, this endpoint is lightweight — it only checks binding reachability (D1 ping, KV get, R2 list), not functional or security tests.

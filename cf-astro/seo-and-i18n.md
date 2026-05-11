@@ -1,123 +1,370 @@
 # cf-astro — SEO & Internationalization
 
-> Sitemap generation, robots.txt, locale routing, and meta tags.
+Complete documentation of the i18n routing system, translation architecture, JSON-LD structured data, sitemap structure, IndexNow integration, and build-time SEO metadata injection.
 
 ---
 
-## Locale Architecture
+## Internationalization (i18n)
+
+### Locale Configuration
+
+File: `src/i18n/config.ts`
+
+| Property | Value |
+|----------|-------|
+| Supported locales | `es` (Spanish), `en` (English) |
+| Default locale | `es` |
+| Prefix default locale | `true` (both locales have URL prefix) |
+| URL structure | `/es/...` and `/en/...` |
+
+**Note**: `prefixDefaultLocale: true` means Spanish pages are at `/es/` not at `/`. This ensures clean canonical URLs and unambiguous hreflang.
 
 ### URL Structure
 
-| Locale | URL Pattern | Default |
-|--------|------------|---------|
-| Spanish (es) | `/`, `/servicios`, `/reservar` | ✅ Yes |
-| English (en) | `/en`, `/en/services`, `/en/booking` | No |
+Both locales use a prefix. There is no unprefixed root route serving content — `/` should redirect to `/es/`.
 
-Spanish is the primary locale (root URLs). English pages are prefixed with `/en/`.
+| Page | Spanish URL | English URL |
+|------|------------|-------------|
+| Homepage | `/es/` | `/en/` |
+| Booking | `/es/booking` | `/en/booking` |
+| Services | `/es/services` | `/en/services` |
+| Franchise | `/es/franchise` | `/en/franchise` |
+| Blog index | `/es/blog` | `/en/blog` |
+| Blog post | `/es/blog/{slug}` | `/en/blog/{slug}` |
+| ARCO form | `/es/legal/arco` | `/en/legal/arco` |
+| Privacy policy | `/es/privacy` | `/en/privacy` |
+| Terms | `/es/terms` | `/en/terms` |
 
-### Routing
+### Page File Structure
 
-Astro's file-based routing with locale directories:
 ```
 src/pages/
-├── index.astro          # / (Spanish homepage)
-├── servicios.astro      # /servicios
-├── reservar.astro       # /reservar
-├── contacto.astro       # /contacto
-├── privacidad.astro     # /privacidad
-├── arco.astro           # /arco
-├── en/
-│   ├── index.astro      # /en (English homepage)
-│   ├── services.astro   # /en/services
-│   ├── booking.astro    # /en/booking
-│   ├── contact.astro    # /en/contact
-│   ├── privacy.astro    # /en/privacy
-│   └── arco.astro       # /en/arco
+├── es/
+│   ├── index.astro           # /es/
+│   ├── booking.astro         # /es/booking
+│   ├── services.astro        # /es/services
+│   ├── franchise.astro       # /es/franchise
+│   ├── blog/
+│   │   ├── index.astro       # /es/blog
+│   │   └── [slug].astro      # /es/blog/{slug}
+│   ├── legal/
+│   │   └── arco.astro        # /es/legal/arco
+│   ├── privacy.astro         # /es/privacy
+│   └── terms.astro           # /es/terms
+└── en/
+    ├── index.astro           # /en/
+    ├── booking.astro         # /en/booking
+    ├── services.astro        # /en/services
+    ├── franchise.astro       # /en/franchise
+    ├── blog/
+    │   ├── index.astro       # /en/blog
+    │   └── [slug].astro      # /en/blog/{slug}
+    ├── legal/
+    │   └── arco.astro        # /en/legal/arco
+    ├── privacy.astro         # /en/privacy
+    └── terms.astro           # /en/terms
 ```
 
-### Language Detection
-- URL-based routing (not browser detection)
-- Language switcher in header toggles between `/path` ↔ `/en/path`
-- User preference not persisted (stateless, privacy-first)
+### i18n Helper Functions
 
-### `hreflang` Tags
-Every page includes alternate language links:
-```html
-<link rel="alternate" hreflang="es" href="https://madagascarhotelags.com/servicios" />
-<link rel="alternate" hreflang="en" href="https://madagascarhotelags.com/en/services" />
-<link rel="alternate" hreflang="x-default" href="https://madagascarhotelags.com/servicios" />
+File: `src/i18n/config.ts`
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `t(key)` | `(key: string) => string` | Dot-notation translation key lookup |
+| `getLocaleFromUrl(url)` | `(url: URL) => string` | Extract locale from URL path prefix |
+| `getLocalizedPath(path, locale)` | `(path: string, locale: string) => string` | Build localized URL |
+| `isValidLocale(locale)` | `(locale: string) => boolean` | Check if locale is supported |
+
+### Translation Files
+
+| File | Language | Used by |
+|------|----------|---------|
+| `src/i18n/translations/es.json` | Spanish (Mexico) | All `/es/` pages |
+| `src/i18n/translations/en.json` | English | All `/en/` pages |
+
+Translation keys use dot notation:
+
+```json
+{
+  "nav.services": "Servicios",
+  "booking.title": "Reservar",
+  "booking.pets.add": "Agregar mascota",
+  "footer.contact": "Contacto"
+}
+```
+
+```astro
+---
+import { t } from '../i18n/config';
+const locale = getLocaleFromUrl(Astro.url);
+---
+<h1>{t('booking.title', locale)}</h1>
 ```
 
 ---
 
-## SEO Configuration
+## Hreflang Tags
 
-### Meta Tags (Per Page)
+Every page includes hreflang alternate links for search engines to understand the language relationship between pages. Generated by `BaseLayout.astro` using Astro's i18n routing data.
 
-Every page includes:
 ```html
-<title>{pageTitle} | Madagascar Pet Hotel</title>
-<meta name="description" content="{pageDescription}" />
-<meta name="robots" content="index, follow" />
-<link rel="canonical" href="{canonicalUrl}" />
+<!-- Example for /es/services -->
+<link rel="alternate" hreflang="es" href="https://madagascarhotelags.com/es/services" />
+<link rel="alternate" hreflang="en" href="https://madagascarhotelags.com/en/services" />
+<link rel="alternate" hreflang="x-default" href="https://madagascarhotelags.com/es/services" />
+```
 
-<!-- Open Graph -->
-<meta property="og:title" content="{pageTitle}" />
+`x-default` points to the Spanish version as the primary locale.
+
+---
+
+## Structured Data (JSON-LD)
+
+### SchemaMarkup.astro
+
+File: `src/components/seo/SchemaMarkup.astro`
+
+Emits two combined schema types on all marketing pages:
+
+**Organization**:
+```json
+{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "Madagascar Pet Hotel",
+  "url": "https://madagascarhotelags.com",
+  "logo": "https://madagascarhotelags.com/logo.png",
+  "contactPoint": {
+    "@type": "ContactPoint",
+    "contactType": "customer service"
+  }
+}
+```
+
+**LocalBusiness**:
+```json
+{
+  "@context": "https://schema.org",
+  "@type": "LocalBusiness",
+  "name": "Madagascar Pet Hotel",
+  "url": "https://madagascarhotelags.com",
+  "address": {
+    "@type": "PostalAddress",
+    "addressLocality": "Aguascalientes",
+    "addressRegion": "AGS",
+    "addressCountry": "MX"
+  },
+  "priceRange": "$$",
+  "openingHours": "...",
+  "serviceType": ["Pet Boarding", "Dog Hotel", "Cat Hotel", "Pet Relocation"]
+}
+```
+
+### BlogPostSchema.astro
+
+File: `src/components/seo/BlogPostSchema.astro`
+
+Emits `Article` schema on blog post pages (`/es/blog/[slug]`, `/en/blog/[slug]`):
+
+```json
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "{post.title}",
+  "description": "{post.excerpt}",
+  "author": {
+    "@type": "Organization",
+    "name": "Madagascar Pet Hotel"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "Madagascar Pet Hotel"
+  },
+  "datePublished": "{post.publishedAt}",
+  "dateModified": "{__LAST_UPDATED__}",
+  "inLanguage": "{locale}"
+}
+```
+
+### ServicePageSchema.astro
+
+File: `src/components/seo/ServicePageSchema.astro`
+
+Emits `Service` + `BreadcrumbList` schemas on service pages:
+
+**Service**:
+```json
+{
+  "@context": "https://schema.org",
+  "@type": "Service",
+  "name": "{service.name}",
+  "description": "{service.description}",
+  "provider": {
+    "@type": "LocalBusiness",
+    "name": "Madagascar Pet Hotel"
+  }
+}
+```
+
+**BreadcrumbList**:
+```json
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://madagascarhotelags.com/es/" },
+    { "@type": "ListItem", "position": 2, "name": "Services", "item": "https://madagascarhotelags.com/es/services" }
+  ]
+}
+```
+
+---
+
+## Build-Time Metadata Injection
+
+Two variables are injected at build time via `Vite define` in `astro.config.ts`:
+
+| Variable | Value | Usage |
+|----------|-------|-------|
+| `__BUILD_ID__` | `Date.now().toString(36)` | ISR cache key namespace (middleware) |
+| `__LAST_UPDATED__` | ISO timestamp of build | `og:updated_time`, `dateModified` in JSON-LD |
+
+```html
+<!-- In BaseLayout.astro -->
+<meta property="og:updated_time" content="{__LAST_UPDATED__}" />
+```
+
+```json
+// In BlogPostSchema.astro
+{ "dateModified": "__LAST_UPDATED__" }
+```
+
+This ensures search engines always see the correct last-modified timestamp without requiring a database query.
+
+---
+
+## Sitemap Structure
+
+cf-astro generates multiple XML sitemaps:
+
+| Sitemap | URL | Contents |
+|---------|-----|---------|
+| Spanish sitemap | `/sitemap-es.xml` | All `/es/` page URLs |
+| English sitemap | `/sitemap-en.xml` | All `/en/` page URLs |
+| Image sitemap | `/sitemap-images.xml` | Gallery and service images |
+| Sitemap index | `/sitemap.xml` | References the above sitemaps |
+
+Each page entry includes:
+- `<loc>` — canonical URL
+- `<lastmod>` — from `__LAST_UPDATED__` build-time variable
+- `<changefreq>` — appropriate for content type
+- `<priority>` — weighted by page importance
+
+### Sitemap Index Example
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap>
+    <loc>https://madagascarhotelags.com/sitemap-es.xml</loc>
+    <lastmod>2026-05-10</lastmod>
+  </sitemap>
+  <sitemap>
+    <loc>https://madagascarhotelags.com/sitemap-en.xml</loc>
+    <lastmod>2026-05-10</lastmod>
+  </sitemap>
+  <sitemap>
+    <loc>https://madagascarhotelags.com/sitemap-images.xml</loc>
+    <lastmod>2026-05-10</lastmod>
+  </sitemap>
+</sitemapindex>
+```
+
+---
+
+## robots.txt
+
+File: `public/robots.txt` (static, served from `public/` directory)
+
+```
+User-agent: *
+Allow: /
+
+Sitemap: https://madagascarhotelags.com/sitemap.xml
+```
+
+All pages are indexable. API endpoints (`/api/*`) are not disallowed because Cloudflare Workers routes handle them — they are not crawlable content.
+
+---
+
+## IndexNow
+
+File: `src/lib/indexnow.ts`
+
+IndexNow allows instant notification to search engines when content changes, rather than waiting for their crawler.
+
+**When triggered**: Every time `POST /api/revalidate` runs (i.e. when cf-admin publishes a CMS change).
+
+**Search engines pinged**:
+- Bing (`https://www.bing.com/indexnow`)
+- Yandex (`https://yandex.com/indexnow`)
+
+**Payload**: List of invalidated page URLs, derived from the `paths` array in the revalidate request.
+
+**Implementation**: Called from `/api/revalidate` after KV deletions complete. Non-fatal — IndexNow failure does not affect the revalidation response.
+
+---
+
+## Open Graph Tags
+
+Every page includes full Open Graph metadata generated by `BaseLayout.astro`:
+
+```html
+<meta property="og:title" content="{pageTitle} | Madagascar Pet Hotel" />
 <meta property="og:description" content="{pageDescription}" />
 <meta property="og:type" content="website" />
 <meta property="og:url" content="{canonicalUrl}" />
 <meta property="og:image" content="{ogImage}" />
 <meta property="og:locale" content="es_MX" />
 <meta property="og:locale:alternate" content="en_US" />
+<meta property="og:updated_time" content="{__LAST_UPDATED__}" />
+```
 
-<!-- Twitter Card -->
+Blog post pages use `og:type = "article"` and include the `BlogPostSchema.astro` Article schema.
+
+---
+
+## Twitter/X Card Tags
+
+```html
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="{pageTitle}" />
 <meta name="twitter:description" content="{pageDescription}" />
-```
-
-### Structured Data (JSON-LD)
-
-```json
-{
-  "@context": "https://schema.org",
-  "@type": "PetStore",
-  "name": "Madagascar Pet Hotel",
-  "url": "https://madagascarhotelags.com",
-  "address": {
-    "@type": "PostalAddress",
-    "addressLocality": "Aguascalientes",
-    "addressCountry": "MX"
-  },
-  "priceRange": "$$",
-  "serviceType": ["Pet Boarding", "Dog Hotel", "Cat Hotel"]
-}
-```
-
-### Sitemap
-
-Auto-generated `sitemap.xml` listing all public pages in both locales with proper `lastmod` dates.
-
-### robots.txt
-```
-User-agent: *
-Allow: /
-Sitemap: https://madagascarhotelags.com/sitemap.xml
+<meta name="twitter:image" content="{ogImage}" />
 ```
 
 ---
 
-## Performance SEO
+## Canonical URLs
+
+Every page sets a canonical link to prevent duplicate content issues between locale versions:
+
+```html
+<link rel="canonical" href="https://madagascarhotelags.com/es/services" />
+```
+
+The canonical always matches the current locale's URL — no cross-locale canonicalization.
+
+---
+
+## Core Web Vitals Considerations
 
 | Metric | Target | Strategy |
 |--------|--------|---------|
-| LCP (Largest Contentful Paint) | <2.5s | ISR cache, edge-served |
-| FID (First Input Delay) | <100ms | Minimal JS, Preact islands |
-| CLS (Cumulative Layout Shift) | <0.1 | Fixed image dimensions |
-| TTFB (Time to First Byte) | <50ms | ISR HIT <10ms, edge compute |
+| LCP | < 2.5s | ISR cache delivers cached HTML in <10ms from edge |
+| FID / INP | < 100ms | Preact islands hydrate lazily (`client:visible`), minimal JS surface area |
+| CLS | < 0.1 | Fixed image dimensions in gallery components |
+| TTFB | < 50ms | ISR HIT serves from KV at edge colo without origin round-trip |
 
-### Astro's Zero-JS Advantage
-By default, Astro ships **zero JavaScript** to the browser. Only interactive islands (booking form, carousel, chatbot widget) load JS. This results in:
-- Smaller page weight (50–100KB typical)
-- Faster FCP/LCP
-- Better Core Web Vitals scores
+**Zero-JS default**: Astro ships no JavaScript by default. Only island components (BookingWizard, ConsentBanner, InfiniteGalleryIsland, LightboxIsland, AutoTabs) send JS to the browser. All section/layout components are pure HTML.

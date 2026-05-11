@@ -1,192 +1,336 @@
 # cf-admin — Audit & Diagnostics
 
-> Ghost Audit Engine, Login Forensics, System Diagnostics, and CF Access log ingestion.
+Ghost Audit Engine, login forensics, CF Access log ingestion via cron, and the diagnostics test suite.
 
 ---
 
-## Ghost Audit Engine
+## Ghost Audit Engine (`src/lib/audit.ts`, 134 lines)
 
-The Ghost Audit Engine provides a tamper-evident record of every significant admin action. It is "ghost" because it runs **after** the response is sent — invisible to the user, zero latency impact.
+### Design
 
-### Design Principles
+The Ghost Audit Engine logs every significant admin action with **zero latency impact** on the request path. The name "ghost" reflects that writes happen after the response is already sent.
 
-1. **Deferred execution**: Uses `ctx.waitUntil()` — audit writes happen after response delivery
-2. **Immutable records**: INSERT-only. No UPDATE or DELETE on audit tables (enforced at the application layer)
-3. **Non-blocking**: If the audit write fails, the original operation still succeeds
-4. **Minimal PII**: IP addresses stored as SHA-256 hashes, never raw
-
-### What Gets Audited
-
-| Event | Table | Trigger |
-|-------|-------|---------|
-| Admin login (success/failure) | `admin_login_forensics` (D1) | Every authentication attempt |
-| Booking status change | `admin_audit_log` (Supabase) | PATCH /api/bookings/:id/state |
-| User role change | `admin_audit_log` | PATCH /api/users/:id |
-| User activation/deactivation | `admin_audit_log` | PATCH /api/users/:id |
-| Page access grant/revoke | `admin_audit_log` | PATCH /api/users/access |
-| Feature flag toggle | `admin_audit_log` | POST /api/features/toggle |
-| CMS content edit | `admin_audit_log` | PATCH /api/content/* |
-| Session force-kick | `admin_audit_log` | POST /api/users/force-kick |
-| ARCO document access | `admin_audit_log` | GET /api/arco/get-document |
-| System diagnostic run | `admin_diagnostics_log` (D1) | POST /api/diagnostics/run |
-
-### Audit Log Entry Structure
-
+**Core pattern:**
 ```typescript
-// src/lib/audit.ts
-interface AuditEntry {
-  admin_email: string;        // Who performed the action
-  action: string;             // 'BOOKING_STATUS_CHANGED', 'USER_DEACTIVATED', etc.
-  resource_type: string;      // 'booking', 'user', 'feature_flag', etc.
-  resource_id: string;        // The affected record's ID
-  before_value?: string;      // Previous state (JSON serialized)
-  after_value?: string;       // New state (JSON serialized)
-  ip_hash: string;            // SHA-256(ip + IP_HASH_SECRET)
-  user_agent: string;
-  cf_ray: string;             // Cloudflare Ray ID for request tracing
-  created_at: string;         // ISO 8601 UTC timestamp
-}
+// ctx.waitUntil() — Cloudflare continues executing this promise after
+// the HTTP response is returned to the browser
+ctx.waitUntil(
+  auditLog(waitUntil, db, {
+    userId, userEmail, userRole,
+    action, module, targetId, targetType,
+    details,   // JSON object — free-form context
+    ipHash     // HMAC(IP, IP_HASH_SECRET) — privacy-safe
+  }, silent)
+)
 ```
 
-### Audit Suppression
+**Design principles:**
+- INSERT-only — no UPDATE or DELETE on audit tables (enforced at application layer)
+- Non-blocking — audit write failure does not affect the user's operation
+- Privacy-safe — IP stored as HMAC hash, never raw
+- Fire-and-forget — zero perceived latency
 
-For DEV-only maintenance operations that would otherwise flood the audit log:
+### D1 Table Schema
 
-```typescript
-// Toggle via /api/audit/silence (DEV role only)
-session.auditSilenced = true;  // Stored in KV session
+```sql
+CREATE TABLE admin_audit_log (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id TEXT,
+  user_email TEXT,
+  user_role TEXT,
+  action TEXT,       -- See action enum below
+  module TEXT,       -- See module enum below
+  target_id TEXT,    -- Who or what was affected (UUID, path, flag key, etc.)
+  target_type TEXT,  -- Type descriptor (user, page, booking, cms_block, etc.)
+  details TEXT,      -- JSON object with free-form context
+  ip_hash TEXT,      -- HMAC(IP, IP_HASH_SECRET) — never raw IP
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_audit_user   ON admin_audit_log(user_id,   created_at DESC);
+CREATE INDEX idx_audit_module ON admin_audit_log(module,    created_at DESC);
 ```
 
-When `auditSilenced` is true, `auditLog()` calls are no-ops. The flag expires with the session (24h max). This is intended for database migration runs or bulk testing — not for production use.
+### Action Enum
+
+| Action | When Used |
+|--------|-----------|
+| `login` | Successful authentication |
+| `logout` | Session destroyed (voluntary) |
+| `view` | Dashboard page viewed |
+| `create` | Record created (user, booking state, CMS block) |
+| `update` | Record updated |
+| `delete` | Record deleted |
+| `grant_access` | PLAC explicit grant added |
+| `revoke_access` | PLAC explicit deny added |
+| `reset_access` | PLAC override removed (revert to role default) |
+| `force_logout` | Force-kick executed on a user |
+| `export` | Data export initiated |
+| `prune` | Old audit records deleted |
+| `registry_update` | Page registry `is_active` toggled |
+
+### Module Enum
+
+| Module | Covers |
+|--------|--------|
+| `auth` | Login, logout, session events |
+| `plac` | Page override grant/revoke/reset |
+| `users` | User create, update, delete, force-kick |
+| `content` | CMS block edits, image uploads |
+| `bookings` | Booking state changes |
+| `media` | R2 image uploads |
+| `debug` | Diagnostic runs, feature flag changes |
+| `system` | Page registry changes |
+| `settings` | Portal and user settings changes |
+| `audit` | Audit prune, audit silence toggle |
+| `chatbot` | Chatbot config, KB edits via proxy |
+
+### API
+
+```typescript
+// Direct call
+await auditLog(waitUntil, db, {
+  userId, userEmail, userRole,
+  action, module, targetId, targetType,
+  details, ipHash
+}, silent)
+
+// Bound logger (preferred in API routes)
+const log = createAuditLogger({
+  db,
+  waitUntil,
+  tableName: 'admin_audit_log',
+  silenced: session.auditSilenced ?? false
+})
+await log({ action: 'update', module: 'users', targetId: userId, ... })
+```
+
+### Audit Silence (DEV-only)
+
+When `session.auditSilenced = true`, all `auditLog()` calls are no-ops. Used during testing or bulk migrations to avoid polluting the audit trail.
+
+Toggled via `POST /api/audit/silence` (DEV role required). Stored in the KV session. Expires automatically with the session (24-hour max lifetime).
+
+```json
+// Request
+{ "silenced": true }
+
+// Effect: session.auditSilenced = true — all subsequent audit writes are skipped
+```
 
 ---
 
-## Login Forensics
+## Login Forensics (`src/lib/auth/security-logging.ts`, 344 lines)
 
-Every authentication attempt is recorded in `admin_login_forensics` (D1) with rich security metadata.
+Every authentication attempt is recorded in D1 `admin_login_logs` with rich security metadata sourced from Cloudflare infrastructure (Tier 1 — server-trusted, cannot be spoofed by the browser).
 
-### Recorded Fields (Tier 1 — Server-Trusted Data)
+### D1 Table Schema
 
-These come directly from Cloudflare infrastructure, not from the browser, and cannot be spoofed:
+```sql
+CREATE TABLE admin_login_logs (
+  id TEXT PRIMARY KEY,
+  email TEXT,
+  event_type TEXT,              -- LOGIN_SUCCESS | LOGIN_FAILED | LOGIN_BLOCKED
+  success INTEGER,              -- 0 or 1
+  is_authorized_email INTEGER,  -- 1=in whitelist, 0=not in whitelist
+  failure_reason TEXT,          -- not_whitelisted | account_inactive | cf_access_denied
+  ip_address TEXT,              -- Raw IP (internal use only, not shown in UI)
+  user_agent TEXT,              -- Truncated to 512 chars
+  geo_location TEXT,            -- "city, country" display string
+  login_method TEXT,            -- google | github | otp
+  created_at TEXT,
 
-| Field | Source | Description |
-|-------|--------|-------------|
-| `email` | CF-Access-JWT claim | Authenticated email (or attempted email) |
-| `event_type` | cf-admin code | `LOGIN_SUCCESS`, `LOGIN_FAILED`, `LOGIN_BLOCKED` |
-| `failure_reason` | cf-admin code | `NOT_WHITELISTED`, `INACTIVE_ACCOUNT`, `JWT_INVALID` |
-| `ip_hash` | `request.headers.get('CF-Connecting-IP')` (hashed) | Origin IP, SHA-256 hashed |
-| `country` | `request.cf.country` | 2-letter country code |
-| `city` | `request.cf.city` | City name |
-| `asn` | `request.cf.asn` | Autonomous System Number |
-| `cf_ray` | `request.headers.get('CF-Ray')` | Cloudflare request ID |
-| `bot_score` | `request.cf.botManagement?.score` | 0–99 (0 = bot, 99 = human) |
-| `tls_version` | `request.cf.tlsVersion` | TLS cipher suite |
-| `http_protocol` | `request.cf.httpProtocol` | HTTP/1.1, HTTP/2, HTTP/3 |
-| `rtt_ms` | `request.cf.clientTcpRtt` | Round-trip time in ms |
-| `identity_provider` | JWT `iss` claim parsed | `google` or `github` |
-| `cf_sub_id` | JWT `sub` claim | Persistent CF Access user identifier |
-| `cf_jwt_tail` | Last 8 chars of JWT | For cross-referencing with CF Access logs |
+  -- Tier 1: CF request.cf geo data (server-trusted, not from browser headers)
+  latitude TEXT,
+  longitude TEXT,
+  postal_code TEXT,
+  timezone TEXT,
+  continent TEXT,
+  asn INTEGER,
+  asn_org TEXT,
+  colo TEXT,                    -- Cloudflare colocation code (e.g., "LAX", "MAD")
+  tls_version TEXT,
+  http_protocol TEXT,           -- h2, h3
+  client_rtt_ms INTEGER,        -- TCP round-trip time in milliseconds
+
+  -- CF Zero Trust fields (from verified JWT)
+  cf_ray_id TEXT,               -- CF-Ray header — links to Cloudflare dashboard trace
+  cf_access_method TEXT,        -- google | github | otp
+  cf_identity_provider TEXT,    -- google-oauth2, github, otp (idp.type claim)
+  cf_jwt_tail TEXT,             -- Last 16 chars of JWT (audit reference, not secret)
+  cf_bot_score INTEGER          -- CF Bot Management score (if available)
+);
+```
+
+### Event Types
+
+| Event Type | Trigger | Alert Email Sent? |
+|------------|---------|-------------------|
+| `LOGIN_SUCCESS` | CF Access JWT verified + user in whitelist + `is_active = 1` | No |
+| `LOGIN_FAILED` | CF Access JWT invalid or expired (before whitelist check) | No |
+| `LOGIN_BLOCKED` | JWT valid but user not in whitelist OR `is_active = 0` | Yes |
 
 ### Security Alert Emails
 
-Failed login attempts (especially from unwhitelisted emails) trigger an immediate alert email via Resend to `SECURITY_ALERT_EMAIL`:
+On `LOGIN_BLOCKED` events, an HTML alert email is sent via Resend:
+- Dispatched async via `ctx.waitUntil()` — does not block the 403 response
+- Recipient: `ADMIN_EMAIL` (`mascotasmadagascar@gmail.com`)
+- Sender: `team@madagascarhotelags.com` via `RESEND_API_KEY`
+- Email template stored in `email-templates/` directory
 
-```
-Subject: [ALERT] Failed admin login attempt
-Body:
-  Email: unknown@example.com
-  Reason: NOT_WHITELISTED
-  Country: RU (Moscow)
-  Bot Score: 3 (likely bot)
-  Time: 2026-05-08 14:32:11 UTC
-  CF Ray: abc123def456
-```
-
-### Login Forensics UI
-
-Viewable at `/dashboard/logs` under the "Login Security" tab:
-- Searchable by email, country, event type
-- Sortable by time, bot score
-- IP hash shown (not raw IP — for privacy compliance)
-- CF Ray links for cross-referencing with Cloudflare dashboard
+**Email content includes:**
+- Attempted email address
+- Login method (google / github / otp)
+- Timestamp (UTC)
+- Masked IP address
+- Geo location (city, country)
+- CF Ray ID (for cross-referencing with Cloudflare dashboard)
+- User agent string
+- CF Bot Management score (if available)
 
 ---
 
-## Activity Center
+## CF Access Audit Log Cron (`src/workers/scheduled-log-sync.ts`)
 
-The `/dashboard/logs` page is a 4-tab audit command center:
+CF Access logs authentication events at the Cloudflare edge — including blocked attempts that never reach the Worker. The cron imports these into D1 for the login forensics UI.
 
-| Tab | Data Source | What It Shows |
-|-----|-------------|---------------|
-| **Activity Log** | Supabase `admin_audit_log` | All admin actions with before/after values |
-| **Consent Trail** | Supabase `booking_consents` | Customer consent records and privacy receipts |
-| **Email Log** | Supabase `email_audit_log` | Email delivery status (queued/sent/failed/delivered) |
-| **Login Forensics** | D1 `admin_login_forensics` | Authentication attempts with security metadata |
+### Cron Schedule
 
-**Export**: The Activity Log tab supports CSV export (rate limited to 5 exports/hour per admin, DEV/Owner only).
-
-**Log retention**: 
-- Activity/Login logs: kept indefinitely (hotel's legal obligation)
-- Email logs: 90-day rolling retention (configured in Supabase)
-- Older records can be pruned via `/api/audit/prune` (DEV only, requires explicit confirmation)
-
----
-
-## System Diagnostics
-
-The `/dashboard/debug/diagnostics` page runs a comprehensive health check of all connected services.
-
-### Health Check Architecture
-
-All 7 component checks run simultaneously via `Promise.allSettled()` — a single slow check cannot block the others:
-
-```typescript
-// src/pages/api/diagnostics/run.ts
-const [d1, supabase, upstash, chatbot, r2, sentry, queue] = 
-  await Promise.allSettled([
-    checkD1(env),          // SELECT 1 FROM admin_pages LIMIT 1
-    checkSupabase(env),    // SELECT count(*) FROM admin_authorized_users
-    checkUpstash(env),     // PING
-    checkChatbot(env),     // GET {CHATBOT_WORKER_URL}/api/health
-    checkR2(env),          // HEAD madagascar-images/health-check.txt
-    checkSentry(env),      // Verify DSN format + attempt connection
-    checkQueue(env),       // Implicit (if binding exists, queue is healthy)
-  ]);
+```toml
+[triggers]
+crons = ["*/5 * * * *"]   # Every 5 minutes — 288 invocations per day
 ```
-
-### Result Interpretation
-
-| Status | Meaning |
-|--------|---------|
-| `healthy` | Check completed within timeout with expected response |
-| `degraded` | Check completed but response was unexpected |
-| `unreachable` | Check timed out or returned network error |
-| `unknown` | Check threw an unexpected exception |
-
-Results are stored in D1 `admin_diagnostics_log` for historical tracking (viewable in the Diagnostics History page).
-
-**Timeout per check**: 5 seconds (components that exceed this are marked `unreachable` — the UI does not hang).
-
----
-
-## Cloudflare Access Audit Log Ingestion
-
-cf-admin runs a **5-minute cron trigger** (`*/5 * * * *`) to pull authentication events from the Cloudflare Zero Trust API and persist them in D1.
 
 ### Cron Flow
 
 ```
-1. Cron fires (every 5 minutes)
-2. cf-admin calls Cloudflare API:
-   GET https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/access/logs/access-requests
+1. handleScheduled() fires every 5 minutes
+2. Read last-synced timestamp from KV: cf-audit-last-synced
+3. GET https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/access/logs/access_requests
    Authorization: Bearer {CF_API_TOKEN_READ_LOGS}
-3. Parse events: filter for application = secure.madagascarhotelags.com
-4. For each new event (since last poll):
-   a. Upsert into D1 admin_login_forensics (idempotent on cf_ray)
-   b. If LOGIN_FAILED: send Resend security alert
-5. Update D1 last_poll_timestamp
+   (reads only events since last-synced timestamp)
+4. Filter events for application AUD: CF_ACCESS_AUD
+5. For each new event:
+   a. Upsert into D1 admin_login_logs (idempotent on cf_ray_id)
+   b. If event type is LOGIN_BLOCKED: dispatch security alert email via Resend
+6. Write current ISO timestamp to KV: cf-audit-last-synced
 ```
 
-**Why this matters**: CF Access logs include authentication events that happen at the edge before any Worker code runs — including blocked attempts that never reach cf-admin. This gives complete visibility into who tried to access the admin portal.
+**Required bindings/secrets:**
+- `CF_API_TOKEN_READ_LOGS` — read-only scope: `Access: Audit Logs: Read`
+- `CF_ACCOUNT_ID` — `320d1ebab5143958d2acd481ea465f52` (in `wrangler.toml [vars]`)
+- `SESSION` KV namespace (for `cf-audit-last-synced` key)
+- `DB` D1 database
 
-**Required secrets**: `CF_API_TOKEN_READ_LOGS` (read-only scoped to Zero Trust audit logs), `CF_ACCOUNT_ID` (wrangler.toml var).
+---
+
+## Audit Log Activity Center (UI)
+
+The `/dashboard/logs` page is a multi-tab audit command center:
+
+| Tab | Component | Data Source | Contents |
+|-----|-----------|-------------|----------|
+| Activity Log | `ActivityLogTab.tsx` | D1 `admin_audit_log` | All admin actions — paginated, filterable |
+| Login Forensics | `LoginForensicsTab.tsx` | D1 `admin_login_logs` | Full forensics: IP hash, geo, user-agent, CF fields |
+| Email Log | `EmailLogTab.tsx` | D1 or Supabase | Email delivery status and audit trail |
+| Consent Trail | `ConsentTrailTab.tsx` | D1 or Supabase | Customer consent records and privacy receipts |
+
+**Log retention:**
+- Audit and login logs: kept indefinitely (legal obligation)
+- Old records can be pruned via `POST /api/audit/prune` (DEV role required, per retention policy)
+
+---
+
+## Diagnostics System (`src/lib/diagnostics/`)
+
+The diagnostics portal (`/dashboard/debug/diagnostics`) runs a comprehensive health check suite across all infrastructure components.
+
+### Architecture
+
+- All tests run via `runner.ts` which orchestrates test categories using `Promise.allSettled()`
+- A single slow or failing test does not block others
+- Results are persisted to D1 `admin_diagnostic_runs` via `ctx.waitUntil()`
+- Historical results viewable via `GET /api/diagnostics/results`
+
+### Test Categories
+
+#### Connectivity Tests
+
+| Test | Method | What Is Verified |
+|------|--------|------------------|
+| D1 database ping | `SELECT 1` via D1 binding | Database reachable, measures latency |
+| R2 bucket connectivity | List objects | R2 binding functional |
+| KV namespace read/write | PUT + GET + DELETE | KV round-trip functional |
+| Supabase REST API ping | REST health endpoint | Supabase reachable from Worker |
+| Upstash Redis connection | Redis PING command | Rate limit store reachable |
+
+#### Functional Tests
+
+| Test | What Is Verified |
+|------|-----------------|
+| Session creation + retrieval roundtrip | KV write → read → compare |
+| PLAC access map computation | D1 JOIN query runs correctly |
+| JWT verification (dummy token) | `verifyZeroTrustJwt` logic |
+| Rate limiter functionality | Upstash sliding window increments |
+
+#### Security Tests
+
+| Test | What Is Verified |
+|------|-----------------|
+| CSRF token validation | `csrf.ts` rejects invalid tokens |
+| Rate limit enforcement | Endpoint correctly returns 429 after threshold |
+| Page access restriction | PLAC denies access to restricted path |
+| Role hierarchy enforcement | `hasPermission()` denies lower roles correctly |
+
+### D1 Results Schema
+
+```sql
+CREATE TABLE admin_diagnostic_runs (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  test_results TEXT,       -- JSON array of individual test outcomes
+  overall_status TEXT,     -- pass | fail | degraded
+  created_at TEXT
+);
+```
+
+### Diagnostic API Endpoints
+
+| Method | Path | Min Role | Description |
+|--------|------|----------|-------------|
+| POST | `/api/diagnostics/run` | dev | Execute full suite — returns run_id immediately |
+| GET | `/api/diagnostics/results` | dev | Fetch all historical runs from D1 |
+| GET | `/api/diagnostics/infrastructure` | admin | Real-time infrastructure status (no D1 persistence) |
+| GET | `/api/diagnostics/ping` | — | Simple liveness — `{ "ok": true }` |
+| GET | `/api/health` | — | Public health check with component latency |
+
+### Result Status Values
+
+| Status | Meaning |
+|--------|---------|
+| `pass` | All checks completed with expected responses |
+| `fail` | One or more checks returned unexpected response or error |
+| `degraded` | All checks completed but some showed elevated latency or warnings |
+
+### UI Components
+
+| Component | Purpose |
+|-----------|---------|
+| `SystemDiagnostics.tsx` | Main diagnostics runner panel |
+| `DiagnosticsTestList.tsx` | Test result table with pass/fail indicators |
+| `DiagnosticsInfraBar.tsx` | Top-of-page health indicator strip |
+| `SystemDiagnosticsHistory.tsx` | Historical run browser |
+
+---
+
+## Performance Benchmarks (`src/lib/diagnostics/benchmarks.ts`)
+
+The benchmarks module collects performance metrics during diagnostic runs:
+
+- D1 query latency (p50, p95)
+- KV read/write latency
+- Supabase query latency
+- Upstash Redis latency
+- CF service binding round-trip latency (CHATBOT_SERVICE, ASTRO_SERVICE)
+
+Results are included in the `test_results` JSON of each diagnostic run.

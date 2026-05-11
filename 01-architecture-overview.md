@@ -84,7 +84,7 @@ graph TB
 - **Adapter**: `@astrojs/cloudflare` (Workers runtime)
 - **Database**: Supabase PostgreSQL via Supabase JS + D1 for audit/flags
 - **Purpose**: Internal admin portal for staff and developers
-- **Key Features**: Cloudflare Zero Trust authentication, RBAC (dev/admin/editor/viewer), PLAC page-level access control, CMS with ISR revalidation, booking management, chatbot admin proxy, CF Access audit log polling via cron, system diagnostics
+- **Key Features**: Cloudflare Zero Trust authentication, RBAC (dev/owner/super_admin/admin/staff — 5 tiers), PLAC page-level access control, CMS with ISR revalidation, booking management, chatbot admin proxy via Service Binding, CF Access audit log polling via cron (`*/5 * * * *`), system diagnostics, Ghost Audit Engine, login forensics
 - **Custom Domain**: `secure.madagascarhotelags.com` (planned)
 
 ### cf-chatbot — AI Chatbot
@@ -105,26 +105,14 @@ graph TB
 
 ## Inter-Service Communication
 
-### Current: HTTP-Based
+| From | To | Method | Auth | Binding |
+|------|----|--------|------|---------|
+| cf-admin | cf-chatbot | **Service Binding** (`CHATBOT_SERVICE`) | None (implicit trust) | `[[services]]` in wrangler.toml |
+| cf-admin | cf-astro | **Service Binding** (`ASTRO_SERVICE`) + HTTP fallback | None (binding) / `REVALIDATION_SECRET` (fallback) | `[[services]]` in wrangler.toml |
+| cf-astro | cf-email-consumer | Cloudflare Queue produce | Binding (implicit) | `EMAIL_QUEUE` |
+| cf-admin | cf-email-consumer | Cloudflare Queue produce | Binding (implicit) | `EMAIL_QUEUE` |
 
-| From | To | Method | Auth |
-|------|----|--------|------|
-| cf-admin | cf-chatbot | HTTP REST via `CHATBOT_WORKER_URL` | `X-Admin-Key` header |
-| cf-admin | cf-astro | HTTP webhook `/api/revalidate` | `REVALIDATION_SECRET` |
-| cf-astro | cf-email-consumer | Cloudflare Queue (produce) | Binding (implicit) |
-| cf-admin | cf-email-consumer | Cloudflare Queue (produce) | Binding (implicit) |
-
-### Recommended: Service Bindings
-Service Bindings eliminate network hops for intra-account Worker-to-Worker calls:
-```toml
-# wrangler.toml (cf-admin)
-[[services]]
-binding = "CHATBOT"
-service = "cf-chatbot"
-```
-- **Latency**: 0ms network overhead (same isolate pool)
-- **Cost**: $0 (no billable subrequest)
-- **Security**: No secret needed (binding is implicit trust)
+Service Bindings (`CHATBOT_SERVICE`, `ASTRO_SERVICE`) are zero-latency intra-account Worker calls — no TLS, no DNS, no billable subrequest. Blocker 4 (HTTP proxies) is resolved.
 
 ---
 

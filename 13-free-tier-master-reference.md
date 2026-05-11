@@ -240,7 +240,7 @@ Used by cf-astro and cf-admin for custom telemetry (page views, booking events, 
 | Performance transactions | 10,000 | ~500–2,000 | ~80–95% |
 | Replays | 50 | 0 (disabled — LCP impact) | — |
 
-**Configuration**: 10% trace sampling (`tracesSampleRate: 0.1`) to conserve free tier. Session Replay explicitly disabled. Error alerts sent to developer email.
+**Configuration**: Smart sampling via `tracesSampler` (50% for critical routes like `/booking` & `/api/contact`, 10% for other APIs, and 0% for static pages) to strictly conserve free tier limits. Android In-App Browser (IAB) noise is explicitly filtered. Session Replay is disabled, but a **PostHog Bridge** automatically injects `posthog_id` as a Sentry tag to allow cross-referencing Sentry errors with PostHog session recordings.
 
 **First bottleneck**: 5,000 errors/month — only reached if there are systemic bugs affecting most requests. Normal operation should produce <100 errors/month.
 

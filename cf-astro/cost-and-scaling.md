@@ -1,102 +1,164 @@
 # cf-astro — Cost & Scaling
 
-> Volume capacity, per-endpoint costs, and scaling projections.
+Current cost breakdown, free tier headroom per binding, first bottleneck analysis, and scaling projections.
 
 ---
 
-## Current Cost: $0–$5/mo
+## Current Cost: $0/month
 
-All cf-astro operations fall within free tier limits at current scale.
-
-| Resource | Current Usage | Free Tier | Utilization |
-|----------|-------------|-----------|-------------|
-| Workers requests | ~5K/mo | 10M/mo | <0.1% |
-| D1 reads | ~500/day | 5M/day | <0.01% |
-| KV reads (ISR) | ~200/day | 100K/day | 0.2% |
-| KV writes (ISR) | ~50/day | 1K/day | 5% |
-| R2 storage | ~300MB | 10GB | 3% |
-| R2 reads | ~1K/mo | 10M/mo | <0.01% |
-| Queue produces | ~100/mo | 1M/mo | <0.01% |
-| Analytics Engine | ~200/day | 100K/day | 0.2% |
+At 10–20 bookings per day (~300–600 bookings/month), all cf-astro operations fall well within free tier limits across every Cloudflare and third-party service used.
 
 ---
 
-## Per-Endpoint Cost Analysis
+## Current Cost Breakdown
 
-### GET / (Homepage)
+| Service | Current usage | Free tier limit | Utilization | Monthly cost |
+|---------|-------------|----------------|-------------|-------------|
+| Workers compute | <<1% of 100K req/day | 100,000 req/day (Standard) | <0.1% | $0 |
+| KV reads (ISR hits) | Reads free | Unlimited reads | — | $0 |
+| KV writes (ISR misses) | <<1K/day | 1,000 writes/day (Free) | <5% | $0 |
+| D1 reads | <<5M/day | 5,000,000 reads/day | <0.01% | $0 |
+| D1 writes | Minimal | 100,000 writes/day | <0.01% | $0 |
+| R2 storage | <<10GB | 10 GB | <3% | $0 |
+| R2 egress | — | $0 forever | — | $0 |
+| R2 Class A ops (writes) | <<1M/month | 1,000,000/month | <0.01% | $0 |
+| R2 Class B ops (reads) | <<10M/month | 10,000,000/month | <0.01% | $0 |
+| Queue operations | <<10K ops/day | 1,000,000 ops/month | <0.01% | $0 |
+| Analytics Engine | <<100K datapoints/day | 100,000/day | <0.2% | $0 |
+| Workers AI | <<10K neurons/day | 10,000 neurons/day (rarely used) | Low | $0 |
+| Sentry | Low error volume | Free tier (shared DSN) | Low | $0 |
+| BetterStack (Logtail) | Low log volume | Free tier | Low | $0 |
+| Upstash Redis | Low rate-limit checks | Free tier | Low | $0 |
 
-| Component | ISR HIT | ISR MISS |
-|-----------|---------|----------|
-| Workers CPU | ~0.5ms | ~15ms |
-| KV read | 1 read ($0) | 1 read + 1 write ($0) |
-| D1 (feature flags) | 0-1 read ($0) | 0-1 read ($0) |
-| Supabase | 0 queries | 1-3 queries ($0) |
-| Analytics Engine | 1 write ($0) | 1 write ($0) |
-| **Total cost** | **~$0.000001** | **~$0.00001** |
+**Total: $0/month**
 
-### POST /api/booking
+---
 
-| Component | Cost per Request |
-|-----------|-----------------|
-| Workers CPU | ~20ms ($0) |
-| Turnstile verify | 1 subrequest ($0) |
-| Upstash rate limit | 2 Redis commands ($0) |
-| Supabase INSERTs | 3-5 queries (~$0.000001) |
-| Queue produces | 2 messages ($0) |
-| Analytics Engine | 1 write ($0) |
-| **Total cost** | **~$0.00001** |
+## Free Tier Headroom Per Binding
 
-At 1,000 bookings/month: **~$0.01** in compute costs.
+### ISR_CACHE KV — First Bottleneck
+
+KV writes are the most constrained resource. The free tier allows 1,000 writes/day.
+
+| Scenario | KV writes/day | Headroom |
+|----------|-------------|---------|
+| Current (10–20 bookings/day) | ~50 | 20x |
+| 5x growth (50–100 bookings/day) | ~250 | 4x |
+| 10x growth (100–200 bookings/day) | ~500 | 2x |
+| Upgrade trigger | ~1,000 | 1x (limit hit) |
+
+**Why KV writes are the first bottleneck**: Every ISR cache MISS writes one KV entry per page. After a deployment, all pages are cold until visited. At 10x current traffic, writes approach the free limit.
+
+**Upgrade path**: KV Standard plan — $5/month for unlimited writes.
+
+### Workers Compute
+
+| Scenario | Requests/day | Free limit | Headroom |
+|----------|------------|-----------|---------|
+| Current | ~170 | 100,000 | 588x |
+| 10x growth | ~1,700 | 100,000 | 58x |
+| 100x growth | ~17,000 | 100,000 | 5.8x |
+| Upgrade trigger | ~100,000/day | — | Workers Paid: $5/month + $0.50/million |
+
+### D1 Database
+
+| Scenario | Reads/day | Free limit | Headroom |
+|----------|---------|-----------|---------|
+| Current | ~500 | 5,000,000 | 10,000x |
+| 1000x growth | ~500,000 | 5,000,000 | 10x |
+
+D1 is not a bottleneck at any foreseeable scale for this project.
+
+### Analytics Engine
+
+| Scenario | Datapoints/day | Free limit | Headroom |
+|----------|-------------|-----------|---------|
+| Current | ~200 | 100,000 | 500x |
+| 10x growth | ~2,000 | 100,000 | 50x |
+| 100x growth | ~20,000 | 100,000 | 5x |
+
+### Workers AI
+
+| Scenario | Neurons/day | Free limit | Headroom |
+|----------|-----------|-----------|---------|
+| Blog gen (rare) | ~5,000 per post | 10,000 | 2 posts/day max free |
+| FAQ gen (rare) | ~1,000 per run | 10,000 | 10 runs/day max free |
+
+Workers AI is used on-demand by admin only. At current usage (a few posts/month), it is nowhere near the limit.
+
+---
+
+## Email Costs (Resend) — First Paid Service
+
+Resend charges based on email volume, not Cloudflare free tier.
+
+| Plan | Emails/month | Cost |
+|------|------------|------|
+| Free | 3,000 | $0 |
+| Pro | Unlimited | ~$20/month |
+
+**Current email volume** (2 emails per booking: admin + customer, plus contact form):
+- 10–20 bookings/day × 2 emails = 20–40 emails/day = 600–1,200/month
+- Plus contact form emails (~10–30/month)
+- Total: ~630–1,230/month — well within free 3,000/month
+
+**Upgrade trigger**: ~45 bookings/day (1,350 emails/month from bookings alone approaches 3,000 limit). Resend is the first service that will require payment at scale.
 
 ---
 
 ## Scaling Projections
 
-### At 10x Traffic (50K visits/mo)
+### 10x Current Scale (~100–200 bookings/day, ~50K visits/month)
 
 | Resource | Usage | Cost |
 |----------|-------|------|
-| Workers | 50K req/mo | $0 (within Standard) |
-| KV reads | 2K/day | $0 |
-| KV writes | 500/day | $0 (approaching limit) |
-| D1 reads | 5K/day | $0 |
-| R2 storage | 1-2GB | $0 |
-| Supabase queries | ~10K/mo | $0 |
-| **TOTAL** | | **$0** (within free tiers) |
+| Workers compute | ~17K req/day | $0 (within 100K free) |
+| KV reads | ~2K/day | $0 |
+| KV writes | ~500/day | $0 (approaching 1K limit) |
+| D1 reads | ~5K/day | $0 |
+| R2 storage | ~1–2 GB | $0 |
+| Queue ops | ~10K/day | $0 |
+| Analytics Engine | ~2K datapoints/day | $0 |
+| Resend emails | ~12K–24K/month | $0 (upgrade needed — Pro plan) |
+| **TOTAL** | | **~$0–$20/month** (Resend Pro if bookings exceed 1,500/month) |
 
-### At 100x Traffic (500K visits/mo)
+### 100x Current Scale (~1,000–2,000 bookings/day, ~500K visits/month)
 
 | Resource | Usage | Cost |
 |----------|-------|------|
-| Workers | 500K req/mo | $0 (within Standard) |
-| KV reads | 20K/day | $0 |
-| KV writes | 5K/day | Needs Standard ($5/mo) |
-| D1 reads | 50K/day | $0 |
-| R2 storage | 5-10GB | $0 |
-| Supabase queries | ~100K/mo | $0 |
-| **TOTAL** | | **~$5/mo** |
-
-### ISR Cache Hit Rate Impact
-
-| Hit Rate | SSR Renders/Day (at 5K visits/day) | Supabase Cost |
-|----------|-----------------------------------|--------------| 
-| 50% | 2,500 | ~$0.001/day |
-| 80% | 1,000 | ~$0.0004/day |
-| 95% | 250 | ~$0.0001/day |
-
-**Target**: 80%+ ISR cache hit rate to minimize Supabase queries.
+| Workers compute | ~170K req/day | $5/month (Workers Paid, $0.50/million) |
+| KV reads | ~20K/day | $0 |
+| KV writes | ~5K/day | $5/month (KV Standard) |
+| D1 reads | ~50K/day | $0 |
+| R2 storage | ~5–10 GB | $0 |
+| Queue ops | ~100K/day | $0 |
+| Analytics Engine | ~20K datapoints/day | $0 |
+| Resend emails | ~120K–240K/month | ~$20–$50/month (Resend Pro) |
+| **TOTAL** | | **~$30–$60/month** |
 
 ---
 
-## Capacity Limits
+## ISR Cache Impact on Cost
 
-| Metric | Hard Limit | Current | Headroom |
-|--------|-----------|---------|----------|
-| Requests/day | 333K (Standard) | ~170 | 1,960x |
-| KV reads/day | 100K (Free) | ~200 | 500x |
-| KV writes/day | 1K (Free) | ~50 | 20x ⚠️ |
-| D1 reads/day | 5M (Free) | ~500 | 10,000x |
-| R2 reads/mo | 10M (Free) | ~1K | 10,000x |
-| Queue ops/mo | 1M (Standard) | ~100 | 10,000x |
+Higher ISR cache hit rates directly reduce Supabase query load and Workers CPU time.
 
-**First bottleneck**: KV writes at ~20x headroom. At 10x growth, may need KV Standard plan ($5/mo).
+| ISR hit rate | SSR renders/day (at 5K visits/day) | Supabase queries saved |
+|-------------|-----------------------------------|----------------------|
+| 50% | 2,500 renders | 50% |
+| 80% | 1,000 renders | 80% |
+| 95% | 250 renders | 95% |
+
+The 24-hour TTL and deploy-scoped cache keys mean a fresh deployment temporarily drops hit rate to 0% until pages are warmed. At 5K visits/day, cache warms quickly (<1 hour).
+
+---
+
+## Upgrade Triggers Summary
+
+| Trigger condition | Service to upgrade | Estimated cost |
+|------------------|--------------------|---------------|
+| KV writes approach 1K/day (~10x traffic) | KV Standard | $5/month |
+| Workers requests exceed 100K/day (~100x traffic) | Workers Paid | $5/month base |
+| Resend emails exceed 3K/month (~45 bookings/day) | Resend Pro | ~$20/month |
+| Upstash Redis rate limit hits (very high scale) | Upstash Pay-as-you-go | Minimal |
+
+**Bottom line**: At current scale (10–20 bookings/day), total infrastructure cost is $0/month. The first dollar spent will be on Resend at approximately 45 bookings/day sustained. The first Cloudflare cost appears at approximately 10x current traffic for KV writes.

@@ -53,13 +53,31 @@ graph LR
 
 ### Sentry Configuration
 
-**cf-astro** (`sentry.client.config.ts`):
+**cf-astro** (`sentry.ts`):
 ```typescript
 Sentry.init({
   dsn: import.meta.env.PUBLIC_SENTRY_DSN,
-  tracesSampleRate: 0.2,      // 20% of transactions
+  tracesSampler: (samplingContext) => {
+    // 50% for critical paths (/booking, /api/contact)
+    // 10% for general API routes (/api/*)
+    // 0% for static/marketing pages to conserve quota
+  },
   replaysSessionSampleRate: 0, // No session replays
   replaysOnErrorSampleRate: 0,
+  ignoreErrors: ['Error invoking postMessage: Java object is gone'], // Android IAB noise suppression
+  denyUrls: [/^iabjs:\/\//i],
+});
+```
+
+### PostHog & Sentry Diagnostic Bridge
+
+To correlate Sentry errors with specific user sessions, `posthog_id` is automatically injected into Sentry tags.
+
+**cf-astro** (`analytics-loader.ts`):
+```typescript
+posthog.onFeatureFlags(function() {
+  const distinctId = posthog.get_distinct_id();
+  if (distinctId) setTag('posthog_id', distinctId);
 });
 ```
 

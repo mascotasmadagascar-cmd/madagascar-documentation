@@ -1,6 +1,12 @@
 # cf-astro — Architecture
 
-> Internal architecture, middleware pipeline, and request flow.
+Internal architecture, middleware pipeline, data flows, and integration points.
+
+---
+
+## Overview
+
+cf-astro is a Cloudflare Worker running Astro 6 with static output and per-route SSR opt-in (`export const prerender = false`). Interactive UI is delivered as Preact islands. All data is stored in either Supabase PostgreSQL (transactional data) or Cloudflare D1 (edge-local config/CMS).
 
 ---
 
@@ -8,64 +14,95 @@
 
 ```mermaid
 graph TB
-    R[Incoming Request] --> MW[Middleware Pipeline]
+    R[Incoming Request] --> MW[src/middleware.ts]
 
-    subgraph "Middleware (middleware.ts)"
-        MW --> FF[Load Feature Flags]
-        FF --> RC{Is GET + cacheable?}
-        RC -->|No| NEXT[Pass to Astro]
-        RC -->|Yes| KV{KV ISR Cache Check}
-        KV -->|HIT| HIT[Return cached HTML <10ms]
-        KV -->|MISS| SSR[Astro SSR Render]
-        SSR --> CACHE[Cache in KV via waitUntil]
-        CACHE --> ANA[Write Analytics Engine via waitUntil]
-        ANA --> RES[Return Response]
+    subgraph "Middleware Pipeline — runs on every non-API, non-static request"
+        MW --> L1[Layer 1: Feature Flags]
+        L1 --> L2[Layer 2: ISR Cache Check]
+        L2 -->|KV HIT| HIT[Return cached HTML\nX-ISR-Cache: HIT]
+        L2 -->|KV MISS| SSR[Astro SSR Render]
+        SSR --> L3[Layer 3: Page View Analytics\nwriteDataPoint via waitUntil]
+        SSR --> KVSTORE[Hydrate ISR_CACHE\nvia waitUntil]
+        SSR --> RESP[Return response\nX-ISR-Cache: MISS]
     end
+
+    HIT --> CLIENT[Browser]
+    RESP --> CLIENT
 ```
+
+Middleware is **skipped** for:
+- `/api/*` — API routes handle their own auth/rate limiting
+- `/_astro/*` — compiled JS/CSS assets (served from CF CDN edge cache)
+- Static files in `public/`
 
 ---
 
-## Middleware Pipeline
+## Middleware Pipeline Detail (`src/middleware.ts`)
 
-The middleware (`src/middleware.ts`) executes on every request with three responsibilities:
+### Layer 1 — Feature Flags (3-tier cache)
 
-### 1. Feature Flags (3-Layer Cache)
+Feature flags are read from D1 (`admin_feature_flags` table) but cached aggressively to avoid a DB round-trip on every request.
+
+```mermaid
+graph TD
+    A[Request] --> B{In-memory cache\nage < 10s?}
+    B -->|HIT| USE[locals.features = cached flags]
+    B -->|MISS/stale| C{CF Cache API\nage < 60s?}
+    C -->|HIT| MEM[Update memory cache]
+    MEM --> USE
+    C -->|MISS/stale| D[Query D1: SELECT flag_key, is_enabled\nFROM admin_feature_flags]
+    D --> E[Write to CF Cache API + memory]
+    E --> USE
+```
+
+| Tier | Storage | TTL | Scope |
+|------|---------|-----|-------|
+| 1 | Module-level `let memFlags` variable | 10 seconds | Per V8 isolate instance |
+| 2 | `caches.default` (internal URL key) | 60 seconds | Per Cloudflare colo |
+| 3 | D1 `admin_feature_flags` table | Source of truth | Global |
+
+**Failure behavior**: If D1 is unavailable, the middleware uses stale in-memory values. If memory is empty and D1 is down, `locals.features` is an empty object (all flags default to `false`/off).
+
+**Usage in Astro pages**:
+```astro
+---
+const features = Astro.locals.features;
+const showNewBookingUI = features?.new_booking_ui ?? false;
+---
+```
+
+### Layer 2 — ISR (Incremental Static Regeneration)
 
 ```
-Layer 1: In-Memory (isolate variable, 10s TTL)
-  ↓ MISS
-Layer 2: CF Cache API (internal URL, 60s TTL)
-  ↓ MISS
-Layer 3: D1 Database (admin_feature_flags table)
-  ↓ Result cached back to Layer 1 + Layer 2
+Cache key format: isr:{normalizedPath}#{__BUILD_ID__}
+
+Example: isr:/en/services#a1b2c3
 ```
 
-**Why 3 layers?**
-- Layer 1: Zero-cost, fastest possible (same isolate)
-- Layer 2: Cross-isolate consistency (Cache API is per-colo)
-- Layer 3: Source of truth (updated by cf-admin CMS)
+- `normalizedPath`: trailing slash stripped for consistency (`/services/` → `/services`)
+- `__BUILD_ID__`: `Date.now().toString(36)` injected at build time via Vite define → new namespace per deploy
+- TTL: 24 hours in KV (`ISR_CACHE` namespace)
+- On MISS: SSR renders the page, response returned immediately, KV hydration happens via `ctx.waitUntil` (zero latency impact)
 
-### 2. ISR (Incremental Static Regeneration)
+Response headers set by ISR layer:
 
-**Cache key pattern**: `isr:{pathname}#{buildId}`
+| Header | Value on HIT | Value on MISS |
+|--------|-------------|---------------|
+| `X-ISR-Cache` | `HIT` | `MISS` |
+| `Cache-Control` | `public, max-age=0, must-revalidate` | From SSR |
 
-- `pathname`: Normalized (trailing slash stripped)
-- `buildId`: Injected at build time via `Vite define` → `__BUILD_ID__`
-- Ensures new deployments get fresh cache, old keys auto-expire (24h TTL)
+**Cache invalidation triggers**:
 
-**Cache flow**:
-1. Check KV for `isr:{path}#{buildId}`
-2. **HIT**: Return HTML with `X-ISR-Cache: HIT` header
-3. **MISS**: SSR render → return with `X-ISR-Cache: MISS` → cache via `waitUntil`
+| Trigger | Mechanism | Scope |
+|---------|-----------|-------|
+| 24h TTL expiry | Automatic KV expiry | Per key |
+| CMS update in cf-admin | `POST /api/revalidate` with path list | Specific paths |
+| New deployment | New `__BUILD_ID__` creates entirely new key namespace | All paths |
 
-**Cache invalidation**:
-- Automatic: 24h TTL expiry
-- Manual: cf-admin triggers `/api/revalidate` webhook
-- Deploy: New `buildId` creates new key namespace
+### Layer 3 — Page View Analytics
 
-### 3. Analytics Engine Telemetry
+Extracts metadata from every request and writes a datapoint to Analytics Engine. Runs via `ctx.waitUntil` — fire-and-forget, zero latency impact.
 
-On every cache MISS (post-render), writes to Analytics Engine:
 ```typescript
 env.ANALYTICS.writeDataPoint({
   blobs: ['page_view', path, locale, country, device],
@@ -74,121 +111,310 @@ env.ANALYTICS.writeDataPoint({
 });
 ```
 
-Written via `waitUntil` — zero latency impact on response.
+| Blob index | Field | Source |
+|------------|-------|--------|
+| blob1 | Event type (`page_view`) | Hardcoded |
+| blob2 | URL path | `request.url` |
+| blob3 | Locale (`es` or `en`) | Path prefix |
+| blob4 | Country | `cf-ipcountry` request header |
+| blob5 | Device (`mobile` or `desktop`) | User-Agent regex |
 
 ---
 
-## API Architecture
+## Component Architecture
 
-All API routes are in `src/pages/api/`:
+### Layouts
 
-### Booking Pipeline
+| Layout | Used by |
+|--------|---------|
+| `BaseLayout.astro` | Foundation: SEO meta, JSON-LD, hreflang, scripts |
+| `MarketingLayout.astro` | All public marketing pages (extends BaseLayout, adds Header/Footer) |
+| `BookingLayout.astro` | Booking flow pages (BookingNavbar, no site footer) |
+
+### Preact Island Components
+
+| Component | File | Hydration | Purpose |
+|-----------|------|-----------|---------|
+| BookingWizard | `components/booking/BookingWizard.tsx` | `client:load` | Multi-step booking form state machine |
+| DateRangePicker | `components/booking/DateRangePicker.tsx` | Part of BookingWizard | Calendar UI — disables Sundays and past dates |
+| FormInput | `components/booking/FormInput.tsx` | Part of BookingWizard | Validated input with error feedback |
+| PetTypeSelector | `components/booking/PetTypeSelector.tsx` | Part of BookingWizard | Dog/cat/exotic radio buttons |
+| ServiceSelector | `components/booking/ServiceSelector.tsx` | Part of BookingWizard | Boarding/daycare/relocation selection |
+| StepIndicator | `components/booking/StepIndicator.tsx` | Part of BookingWizard | Visual progress stepper |
+| ArcoForm | `components/forms/ArcoForm.tsx` | `client:load` | ARCO legal request + file upload + Turnstile |
+| ConsentBanner | `components/islands/ConsentBanner.tsx` | `client:load` | Cookie consent with checkbox fingerprinting |
+| AutoTabs | `components/islands/AutoTabs.tsx` | `client:visible` | Services tab switcher with auto-rotation |
+| InfiniteGalleryIsland | `components/islands/InfiniteGalleryIsland.tsx` | `client:visible` | Embla carousel with auto-scroll and lazy images |
+| LightboxIsland | `components/islands/LightboxIsland.tsx` | `client:visible` | Full-screen image modal |
+
+### Static Astro Components (no JS shipped)
+
+| Component | Purpose |
+|-----------|---------|
+| `layout/Header.astro` | Site navigation |
+| `layout/Footer.astro` | Site footer |
+| `sections/Hero.astro` | Hero section |
+| `sections/Services.astro` | Services overview |
+| `sections/Gallery.astro` | Gallery wrapper |
+| `sections/FAQ.astro` | FAQ section |
+| `sections/Testimonials.astro` | Customer testimonials |
+| `sections/About.astro` | About section |
+| `sections/Contact.astro` | Contact section |
+| `seo/SchemaMarkup.astro` | Organization + LocalBusiness JSON-LD |
+| `seo/BlogPostSchema.astro` | Article JSON-LD |
+| `seo/ServicePageSchema.astro` | Service + BreadcrumbList JSON-LD |
+| `ui/FloatingWhatsApp.astro` | Floating WhatsApp CTA button |
+
+---
+
+## Booking 3-Phase Insert Flow
+
 ```mermaid
 sequenceDiagram
-    participant U as User
-    participant T as Turnstile
+    participant Browser
+    participant Worker as CF Worker (POST /api/booking)
     participant RL as Upstash Rate Limit
-    participant Z as Zod Validator
-    participant DB as Supabase (Drizzle)
-    participant Q as Email Queue
+    participant DB as Supabase PostgreSQL
+    participant Q as EMAIL_QUEUE
+    participant AE as Analytics Engine
 
-    U->>T: Submit booking form
-    T->>T: Verify CAPTCHA token
-    T-->>U: Token validated
-    U->>RL: POST /api/booking
-    RL->>RL: Check sliding window (5/hr)
-    RL->>Z: Validate body schema
-    Z->>DB: INSERT booking + pets + consents
-    DB->>DB: Generate booking_ref
-    DB->>Q: Produce admin notification
-    DB->>Q: Produce customer confirmation
-    Q-->>U: 200 OK {bookingRef, trackingId}
+    Browser->>Worker: POST /api/booking {owner data, pets[], service, dates, consent}
+    Worker->>Worker: assertOrigin() CSRF check
+    Worker->>RL: Check sliding window 5/60s
+    RL-->>Worker: OK or 429
+    Worker->>Worker: Zod validate body
+    Note over Worker,DB: Phase 1 (blocking — must succeed)
+    Worker->>DB: INSERT consent_records → get consentId
+    Worker->>DB: INSERT bookings (with consentId FK) → get bookingId, bookingRef
+    Worker-->>Browser: 200 { success, bookingRef, consentId }
+    Note over Worker,AE: Phase 2 (waitUntil — non-blocking)
+    Worker->>DB: INSERT booking_pets[] (parallel)
+    Worker->>DB: INSERT email_audit_logs (parallel)
+    Note over Worker,AE: Phase 3 (waitUntil — non-blocking)
+    Worker->>Q: Push admin notification message
+    Worker->>Q: Push customer confirmation message
+    Worker->>AE: writeDataPoint booking_success
 ```
 
-### Revalidation Webhook
-```
-POST /api/revalidate
-Authorization: Bearer {REVALIDATION_SECRET}
-Body: { paths: ["/", "/en", "/services"] }
+**Degraded mode**: If Phase 2 or 3 fails but Phase 1 succeeded, the response includes `degraded: true`. The booking is saved in the database; email may be missing. Sentry captures the error.
 
-→ Deletes KV keys matching isr:{path}* for the current buildId
-→ Next request triggers fresh SSR
+**Response fields**:
+- `success` — boolean
+- `bookingRef` — `MAD-XXXXXXXXXX` format (random, non-enumerable, not sequential)
+- `consentId` — UUID of the consent record
+- `emailsQueued` — boolean
+- `degraded` — boolean (true if Phase 2/3 failed)
+- `whatsappUrl` — pre-filled WhatsApp link as backup contact
+
+---
+
+## ARCO Document Upload Flow
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Worker as CF Worker (POST /api/arco/submit)
+    participant TS as Turnstile API
+    participant R2 as ARCO_DOCS R2 Bucket
+    participant D1 as madagascar-db D1
+
+    Browser->>Worker: POST /api/arco/submit (multipart form data)
+    Worker->>Worker: 1. Rate limit check (3/60s)
+    Worker->>TS: 2. Verify Turnstile CAPTCHA token
+    TS-->>Worker: pass/fail
+    Worker->>Worker: 3. Check file size <= 5MB
+    Worker->>Worker: 4. Validate extension (jpg/jpeg/png/webp only)
+    Worker->>Worker: 5. Read magic bytes — binary header check (<1ms CPU)
+    Worker->>Worker: 6. Cross-check MIME type against extension
+    Worker->>R2: Upload to arco/{year}/{ticketNumber}/{uuid}
+    Worker->>D1: INSERT legalRequests {ticket_number, arco_right, full_name, email, ...}
+    Worker-->>Browser: 200 { success, ticketNumber, documentUrl, expiresAt }
+```
+
+**Ticket format**: `ARCO-XXXXXX` (6-digit random, not sequential)
+
+**Admin document retrieval**:
+```
+GET /api/arco/get-document?ticket=ARCO-123456
+X-Admin-Secret: {ARCO_ADMIN_SECRET}
+
+→ Timing-safe secret comparison
+→ D1 lookup to get R2 path for ticket
+→ R2 stream with Content-Disposition: attachment
+→ Response headers: X-Ticket, X-Requester, X-ARCO-Right
 ```
 
 ---
 
-## Database Layer (Drizzle ORM)
+## ISR Cache Invalidation Flow
 
-### Why Drizzle over Supabase JS
-- **Type safety**: Schema defines TypeScript types at compile time
-- **Transaction support**: Multi-table inserts (booking + pets + consents) in single transaction
-- **Bundle size**: ~50KB (vs Supabase JS ~150KB)
-- **SQL control**: Complex queries (joins, aggregations) without REST API limitations
+```mermaid
+sequenceDiagram
+    participant Admin as cf-admin (CMS update)
+    participant Worker as CF Worker (POST /api/revalidate)
+    participant KV as ISR_CACHE KV
+    participant IX as IndexNow API
 
-### Connection Pattern
+    Admin->>Worker: POST /api/revalidate\nAuthorization: Bearer {REVALIDATION_SECRET}\n{ paths: [...], cmsData?: {...} }
+    Worker->>Worker: Timing-safe bearer token check
+    loop For each path
+        Worker->>KV: Delete key isr:{normalizedPath}#{buildId}
+    end
+    opt cmsData provided
+        loop For each cmsData key in allowlist
+            Worker->>KV: Write CMS JSON block
+        end
+    end
+    Worker->>IX: Ping Bing IndexNow
+    Worker->>IX: Ping Yandex IndexNow
+    Worker-->>Admin: 200 { revalidated, paths, cmsKeysWritten, now }
+```
+
+**CMS key allowlist**: `hero`, `services`, `pricing`, `gallery`, `testimonials`, `faqs`, `faq_draft`, `about`, `contact`, `franchise`, `blog_index`, `seo_*`, `blog_draft_*`
+
+---
+
+## Workers AI Flow
+
+```mermaid
+sequenceDiagram
+    participant AdminClient
+    participant Worker as CF Worker
+    participant AI as Workers AI (@cf/meta/llama-3-8b-instruct)
+    participant D1 as madagascar-db D1
+
+    AdminClient->>Worker: POST /api/admin/generate-blog-draft\n{ title, keywords?, lang? }
+    Worker->>Worker: Timing-safe ADMIN_AI_SECRET check
+    Worker->>AI: env.AI.run('@cf/meta/llama-3-8b-instruct', prompt)
+    AI-->>Worker: 800-word HTML blog post
+    Worker->>D1: INSERT cms_content { block_type: 'blog_draft', ... }
+    Worker-->>AdminClient: { success, draft: { title, slug, excerpt, content, lang } }
+
+    AdminClient->>Worker: POST /api/admin/generate-faqs
+    Worker->>AI: env.AI.run(prompt for 12 FAQ Q&As)
+    AI-->>Worker: 12 question/answer pairs
+    Worker->>D1: INSERT cms_content { block_type: 'seo', block_key: 'faq_draft' }
+    Worker-->>AdminClient: { success, count, faqs: [{question, answer}] }
+```
+
+**Quota**: 10,000 neurons/day free tier. Blog/FAQ generation is used rarely (on-demand by admin).
+
+---
+
+## PostHog Proxy Flow
+
+All client-side analytics events are routed through the Worker instead of calling PostHog directly:
+
+```
+Browser → POST /api/ingest/[...path] → CF Worker → https://us.i.posthog.com
+
+Forwarded headers: content-type, accept, user-agent
+Stripped from response: set-cookie, x-frame-options
+```
+
+This keeps PostHog calls server-originated, improving privacy (no third-party cookies from client) and avoiding ad blockers.
+
+---
+
+## Database Layer
+
+### Connection (src/lib/db/client.ts)
+
 ```typescript
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 
 const client = postgres(env.DATABASE_URL, {
   ssl: 'require',
-  max: 1,  // Workers: 1 connection per isolate
-  idle_timeout: 20,
+  max: 1,           // 1 connection per V8 isolate
+  idle_timeout: 20, // Close idle connections after 20s
 });
 
 export const db = drizzle(client);
 ```
 
-**Important**: `max: 1` — each V8 isolate should only open one connection. The Workers model naturally limits concurrent connections since each request runs in its own isolate context.
+**Why `max: 1`**: Each V8 isolate handles one request at a time. Opening more than one connection per isolate wastes pool slots.
+
+**Why no Hyperdrive**: The hotel is in Aguascalientes, Mexico (AGS). Supabase is in `us-east-1`. Direct connection is optimal. Hyperdrive + Supavisor would introduce double-pooling overhead for this geography.
+
+**DB role**: `cf_astro_writer` — least-privilege Postgres role with INSERT/UPDATE on specific tables only. No DROP, ALTER, or DELETE of data rows.
 
 ---
 
 ## Rendering Strategy
 
-| Route Pattern | Rendering | Cache |
-|---------------|-----------|-------|
-| `/` (homepage) | SSR | ISR (KV, 24h) |
-| `/en/*` (English pages) | SSR | ISR (KV, 24h) |
-| `/services`, `/gallery` | SSR | ISR (KV, 24h) |
-| `/booking` | SSR | Not cached (dynamic form) |
-| `/api/*` | Server-only | Not cached |
-| `/_astro/*` | Static | CF CDN edge cache |
-
-### Island Architecture
-Interactive components (booking form, carousel, chatbot widget) use Preact islands:
-```astro
----
-import BookingForm from '../components/BookingForm';
----
-<BookingForm client:visible />
-```
-
-`client:visible`: Hydrates only when the component enters the viewport, reducing initial JS load.
+| Route | Rendering | ISR cached |
+|-------|-----------|-----------|
+| `/es/*` marketing pages | SSR (per-request render on MISS) | Yes — 24h KV |
+| `/en/*` marketing pages | SSR | Yes — 24h KV |
+| `/es/booking`, `/en/booking` | SSR | No (form, dynamic) |
+| `/api/*` | Server-only (no prerender) | No |
+| `/_astro/*` | Static (compiled assets) | CF CDN edge cache |
 
 ---
 
-## Error Handling
+## Monitoring Integrations
 
-### Sentry Integration
-```typescript
-// sentry.client.config.ts
-Sentry.init({
-  dsn: import.meta.env.PUBLIC_SENTRY_DSN,
-  tracesSampleRate: 0.2,  // 20% of page loads
-});
-```
+### Sentry (`@sentry/cloudflare`)
 
-### BetterStack Logging
-```typescript
-const log = createRequestLogger(request, env.BETTERSTACK_SOURCE_TOKEN, cfContext);
-log.info('Booking submitted', { bookingRef, email: '***' });
-log.error('Supabase insert failed', { error: err.message });
-// Flush logs via waitUntil at end of request
-log.flush();
-```
+- `captureApiError()` wrapper in `src/lib/error-context.ts` — used by all API routes
+- Span tracking per API call
+- Source maps uploaded by `@sentry/vite-plugin` at build time, deleted post-build for security
+- Release identifier: `cf-astro@{buildId}`
 
-### Graceful Degradation
-- If D1 (feature flags) fails → use stale in-memory cache
-- If KV (ISR cache) fails → fall through to SSR
-- If Supabase fails → return user-friendly error page
-- If Analytics Engine fails → silently drop (non-critical)
+### BetterStack (Logtail) (`@logtail/edge`)
+
+- Batch size: 10 log entries
+- Flush interval: 1000ms
+- Attached metadata on every log line: URL, method, IP, country, user-agent, CF Ray ID
+- Falls back to `console.*` if `BETTERSTACK_SOURCE_TOKEN` is missing (local dev)
+
+### Analytics Engine
+
+Events tracked:
+
+| Event | Trigger |
+|-------|---------|
+| `page_view` | Every non-API page request (via middleware) |
+| `booking_success` | Phase 1 of booking insert completes |
+| `booking_failed_*` | Booking insert error (variant suffix = error type) |
+| `cta_event` | WhatsApp click, phone click, email click, booking CTA |
+| `healthcheck_ping` | GET /api/health called |
+
+### PostHog
+
+Proxied via `/api/ingest/[...path]`. `POSTHOG_HOST` var points to `https://us.i.posthog.com`. No direct browser → PostHog calls.
+
+### IndexNow
+
+Implemented in `src/lib/indexnow.ts`. Called from `/api/revalidate` whenever pages are invalidated. Pings both Bing and Yandex crawlers to accelerate re-indexing.
+
+---
+
+## Security Model
+
+| Concern | Implementation |
+|---------|---------------|
+| CSRF | `assertOrigin()` on all POST routes — allowed origins: `madagascarhotelags.com`, `www.madagascarhotelags.com`, `cf-astro.pages.dev`, `localhost` |
+| Timing attacks | `timingSafeEq()` from `src/lib/security.ts` for all secret/token comparisons |
+| Rate limiting | Upstash Redis sliding window; in-memory `Map` fallback; fail-closed (Redis error → 503, not bypass) |
+| IP extraction | `cf-connecting-ip` (Cloudflare spoofproof header) → `x-forwarded-for` → UUID fallback |
+| CAPTCHA | Cloudflare Turnstile on `/api/arco/submit` |
+| File validation | 6 layers on ARCO upload: rate limit, Turnstile, size ≤5MB, extension whitelist, magic bytes, MIME cross-check |
+| XSS via CMS | `sanitizeHtml()` strips `<script>`, `<iframe>`, `<object>`, `<embed>` and `on*` attributes |
+| DB privilege | `cf_astro_writer` Postgres role — INSERT/UPDATE on designated tables only |
+| Rate limit headers | `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `Retry-After` on 429 responses |
+
+---
+
+## Graceful Degradation
+
+| Component fails | Behavior |
+|-----------------|----------|
+| D1 (feature flags) | Stale in-memory cache used; all flags default off if memory empty |
+| ISR_CACHE KV | Falls through to fresh SSR render |
+| Upstash Redis (rate limit) | In-memory Map fallback; if both fail → 503 (fail-closed) |
+| Analytics Engine | Silent drop (wrapped in try/catch, non-critical) |
+| BetterStack | Falls back to console logging |
+| Booking Phase 2/3 | Returns `degraded: true`; booking record saved; Sentry alert |
+| Email queue push | Non-fatal; logged; booking ref still returned to user |
