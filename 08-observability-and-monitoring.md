@@ -44,7 +44,7 @@ graph LR
 
 | Service | Sentry Package | DSN | Traces | Source Maps | Status |
 |---------|---------------|-----|--------|-------------|--------|
-| cf-astro | `@sentry/astro` + `@sentry/cloudflare` | ✅ | ✅ (20% sample) | ✅ (`@sentry/vite-plugin`) | ✅ Active |
+| cf-astro | `@sentry/browser` (manual) | ✅ | ✅ (`tracesSampler`: 50% booking/contact, 10% APIs, 0% marketing) | ✅ (`@sentry/vite-plugin`) | ✅ Active |
 | cf-admin | `@sentry/astro` + `@sentry/cloudflare` | ✅ | ✅ (100% sample) | ✅ (`@sentry/vite-plugin`) | ✅ Active |
 | cf-chatbot | None | ❌ | ❌ | ❌ | ⚠️ Missing |
 | cf-email-consumer | `@sentry/cloudflare` | ✅ | ✅ (100% sample) | N/A (no build) | ✅ Active |
@@ -73,10 +73,12 @@ Sentry.init({
 
 To correlate Sentry errors with specific user sessions, `posthog_id` is automatically injected into Sentry tags.
 
-**cf-astro** (`analytics-loader.ts`):
+**cf-astro** (`analytics-loader.ts` — PostHog → Sentry bridge):
 ```typescript
-posthog.onFeatureFlags(function() {
-  const distinctId = posthog.get_distinct_id();
+// FIX (2026-05-13): onFeatureFlags is NOT in the PostHog stub.
+// Use onSessionId (IS stubbed) to safely bridge the ID.
+posthog.onSessionId((_sessionId: string) => {
+  const distinctId = posthog.get_distinct_id?.();
   if (distinctId) setTag('posthog_id', distinctId);
 });
 ```
@@ -218,8 +220,14 @@ enabled = true
 
 [observability.logs]
 enabled = true
-head_sampling_rate = 1  # 1.0 = 100% for admin/email, 0.01 for astro at scale
+head_sampling_rate = 1  # 100% — UPDATED 2026-05-13 after booking outage went undetected at 5%
+persist = true
 invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1  # NEVER lower on low-traffic sites (<1000 req/day)
 ```
 
 Accessible via:
