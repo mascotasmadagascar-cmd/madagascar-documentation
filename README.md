@@ -7,9 +7,9 @@
 ![Resend](https://img.shields.io/badge/Resend-000000?style=flat&logo=resend&logoColor=white)
 ![Sentry](https://img.shields.io/badge/Sentry-362D59?style=flat&logo=sentry&logoColor=white)
 ![Upstash](https://img.shields.io/badge/Upstash_Redis-00E9A3?style=flat&logo=redis&logoColor=black)
-![Cost](https://img.shields.io/badge/Infrastructure_Cost-$0%2Fmonth-brightgreen?style=flat)
+![Cost](https://img.shields.io/badge/Platform-Enterprise_Grade-blue?style=flat)
 
-> Complete technical and business documentation for Madagascar Pet Hotel's edge-native web platform — four Cloudflare Workers running at 330+ global PoPs, $0/month infrastructure cost, and full LFPDPPP compliance.
+> Complete technical and business documentation for Madagascar Pet Hotel's edge-native web platform — four Cloudflare Workers running at 330+ global PoPs with enterprise-grade security, observability, and full compliance.
 
 ---
 
@@ -17,7 +17,9 @@
 
 | You are… | Read this first |
 |----------|----------------|
-| **Business stakeholder / prospect** | [Executive Summary](./00-executive-summary.md) — ROI, $0/month story, compliance, service guarantees |
+| **Business stakeholder / prospect** | [Executive Summary](./00-executive-summary.md) — ROI, platform value, compliance, service guarantees |
+| **Product evaluator / investor** | [Feature Catalog & Value Proposition](./14-feature-catalog.md) — full feature inventory, industry benchmarks, competitive positioning |
+| **Sales / client onboarding** | [Platform Deep Dive](./15-platform-deep-dive.md) — service tiers, add-ons, delivery workflow, security & SEO deep dive |
 | **Onboarding developer** | [Developer Guide](./11-developer-guide.md) → [Architecture Overview](./01-architecture-overview.md) |
 | **Security reviewer** | [Security Architecture](./05-security-architecture.md) → [Compliance & Privacy](./10-compliance-and-privacy.md) |
 | **DevOps / infrastructure** | [Service Connections](./12-service-connections.md) → [Free Tier Master Reference](./13-free-tier-master-reference.md) |
@@ -69,6 +71,8 @@
 | 11 | [Developer Guide](./11-developer-guide.md) | Setup, secrets management, deployment, local dev |
 | 12 | [Service Connections](./12-service-connections.md) | Dependency map, shared infra IDs, request lifecycles |
 | 13 | [Free Tier Master Reference](./13-free-tier-master-reference.md) | All service limits, daily usage, headroom %, upgrade triggers |
+| 14 | [Feature Catalog & Value Proposition](./14-feature-catalog.md) | Complete feature inventory, industry benchmarks, cost comparison, traffic capacity |
+| 15 | [Platform Deep Dive](./15-platform-deep-dive.md) | Service tiers, add-on catalog, delivery workflow, email/observability/CMS/SEO/security deep dives |
 | — | [Implementations & Blockers](./implementations-and-blockers.md) | Active blockers — DLQ, Sentry gap, ESM migration |
 
 ---
